@@ -44,7 +44,11 @@ import type {
 import type { ContentGenerator } from './contentGenerator.js';
 import { LoopDetectionService } from '../services/loopDetectionService.js';
 import { ChatCompressionService } from '../context/chatCompressionService.js';
-import { AgentHistoryProvider } from '../context/agentHistoryProvider.js';
+import { ContextManager } from '../context/contextManager.js';
+import { ToolMaskingProcessor } from '../context/processors/toolMaskingProcessor.js';
+import { HistorySquashingProcessor } from '../context/processors/historySquashingProcessor.js';
+import { BlobDegradationProcessor } from '../context/processors/blobDegradationProcessor.js';
+import { SemanticCompressionProcessor } from '../context/processors/semanticCompressionProcessor.js';
 import { ideContextStore } from '../ide/ideContext.js';
 import {
   logContentRetryFailure,
@@ -65,7 +69,6 @@ import { handleFallback } from '../fallback/handler.js';
 import type { RoutingContext } from '../routing/routingStrategy.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { ModelConfigKey } from '../services/modelConfigService.js';
-import { ToolOutputMaskingService } from '../context/toolOutputMaskingService.js';
 import { calculateRequestTokenCount } from '../utils/tokenCalculation.js';
 import {
   applyModelSelection,
@@ -74,6 +77,7 @@ import {
 import { getDisplayString, resolveModel } from '../config/models.js';
 import { partToString } from '../utils/partUtils.js';
 import { coreEvents, CoreEvent } from '../utils/events.js';
+import { ToolOutputMaskingService } from '../context/toolOutputMaskingService.js';
 
 const MAX_TURNS = 100;
 
@@ -95,7 +99,8 @@ export class GeminiClient {
 
   private readonly loopDetector: LoopDetectionService;
   private readonly compressionService: ChatCompressionService;
-  private readonly agentHistoryProvider: AgentHistoryProvider;
+
+  private readonly contextManager: ContextManager;
   private readonly toolOutputMaskingService: ToolOutputMaskingService;
   private lastPromptId: string;
   private currentSequenceModel: string | null = null;
@@ -111,10 +116,15 @@ export class GeminiClient {
   constructor(private readonly context: AgentLoopContext) {
     this.loopDetector = new LoopDetectionService(this.config);
     this.compressionService = new ChatCompressionService();
-    this.agentHistoryProvider = new AgentHistoryProvider(
-      this.config.agentHistoryProviderConfig,
-      this.config,
-    );
+
+    this.contextManager = new ContextManager(this.config, this);
+    // Order matters: Fast, lossless masking -> Intelligent degradation -> Brutal truncation fallback
+    this.contextManager.setProcessors([
+      new ToolMaskingProcessor(this.config),
+      new BlobDegradationProcessor(this.config),
+      new SemanticCompressionProcessor(this.config),
+      new HistorySquashingProcessor(this.config),
+    ]);
     this.toolOutputMaskingService = new ToolOutputMaskingService();
     this.lastPromptId = this.config.getSessionId();
 
@@ -616,11 +626,11 @@ export class GeminiClient {
     const modelForLimitCheck = this._getActiveModelForCurrentTurn();
 
     if (this.config.getContextManagementConfig().enabled) {
-      const newHistory = await this.agentHistoryProvider.manageHistory(
-        this.getHistory(),
-        signal,
-      );
-      if (newHistory.length !== this.getHistory().length) {
+      const newHistory = await this.contextManager.processHistory([
+        ...this.getHistory(),
+      ]);
+      // We check if the reference changed or if elements changed
+      if (newHistory !== this.getHistory()) {
         this.getChat().setHistory(newHistory);
       }
     } else {
@@ -634,7 +644,9 @@ export class GeminiClient {
     const remainingTokenCount =
       tokenLimit(modelForLimitCheck) - this.getChat().getLastPromptTokenCount();
 
-    await this.tryMaskToolOutputs(this.getHistory());
+    if (!this.config.getContextManagementConfig().enabled) {
+      await this.tryMaskToolOutputs(this.getHistory());
+    }
 
     // Estimate tokens. For text-only requests, we estimate based on character length.
     // For requests with non-text parts (like images, tools), we use the countTokens API.
